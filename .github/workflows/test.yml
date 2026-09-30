@@ -26,8 +26,39 @@ jobs:
 
       # The plugin wraps the real `codegraph` CLI; install it so the harness
       # exercises the actual binary on PATH.
+      #
+      # `@colbymchenry/codegraph` is only a thin launcher: the heavy artifact is
+      # a per-platform optionalDependency (e.g. codegraph-linux-x64). npm treats
+      # an unfetchable optional dep as SUCCESS and silently skips it, so a
+      # registry that fails to mirror the platform package leaves the shim
+      # installed but unable to exec anything — surfacing later as
+      # `spawn .../bin/codegraph ENOENT`. Install the matching platform package
+      # explicitly (so a silent skip cannot happen), then VERIFY the binary is
+      # genuinely runnable instead of trusting the install step's exit code.
       - name: Install codegraph CLI
-        run: npm install -g @colbymchenry/codegraph
+        run: |
+          set -euo pipefail
+          npm install -g @colbymchenry/codegraph
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  platform='@colbymchenry/codegraph-linux-x64' ;;
+            Linux-aarch64) platform='@colbymchenry/codegraph-linux-arm64' ;;
+            Darwin-arm64)  platform='@colbymchenry/codegraph-darwin-arm64' ;;
+            Darwin-x86_64) platform='@colbymchenry/codegraph-darwin-x64' ;;
+            *)             platform='' ;;
+          esac
+          if [ -n "$platform" ]; then
+            echo "ensuring platform bundle $platform is present"
+            npm install -g "@colbymchenry/codegraph@latest" "$platform" || \
+              echo "::warning::$platform could not be installed; relying on the shim's download fallback"
+          fi
+
+      - name: Verify the codegraph CLI actually runs
+        run: |
+          set -euo pipefail
+          command -v codegraph || { echo "::error::codegraph is not on PATH"; exit 1; }
+          # A broken shim (missing platform bundle) fails here rather than
+          # 14 tests deep into the harness.
+          codegraph --version
 
       # @deepseek-ai/dsh-tools and schemastery are peerDependencies of the
       # plugin; install them into the repo's node_modules so the test harness
