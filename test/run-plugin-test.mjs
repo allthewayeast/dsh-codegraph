@@ -10,11 +10,11 @@
 // Config schema, and message factory the plugin is exercised against. That is
 // what makes this suite a cross-version gate — see section 0 below.
 import { spawn } from 'node:child_process'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -41,13 +41,54 @@ function runProc(argv, cwd) {
   })
 }
 
+// Scripts resolveExecutable had to fall back to running under the current
+// Node (a `#!/usr/bin/env node` launcher that Node cannot exec directly).
+// Keyed by resolved script path -> the original command name.
+const shimScripts = new Map()
+
 const subprocessService = {
   async resolveExecutable(name) {
+    // Resolve the way the REAL subprocess service does: hand back something
+    // Node can actually spawn.
+    //
+    // `which` alone is not enough. npm global bins are symlinks into the
+    // package (or, for shim packages, a `#!/usr/bin/env node` launcher), and a
+    // shell happily runs those while `spawn()` needs a real executable file at
+    // the resolved path. On CI `which codegraph` returned a path that
+    // `codegraph --version` ran fine from bash yet `spawn()` rejected with
+    // ENOENT — 14 tests failed on an environment quirk that had nothing to do
+    // with the plugin. So: locate it, then prove Node can spawn it, and fall
+    // back to running the JS entry through the current Node when it cannot.
+    const candidates = []
     try {
-      return execFileSync('which', [name]).toString().trim()
-    } catch {
-      throw new Error(`not found: ${name}`)
+      candidates.push(execFileSync('which', [name]).toString().trim())
+    } catch { /* not on PATH; try the fallbacks below */ }
+
+    // Fallback: a global bin directory that is not the running Node's.
+    const nodeDir = dirname(process.execPath)
+    candidates.push(join(nodeDir, name))
+
+    for (const candidate of candidates) {
+      if (!candidate || !existsSync(candidate)) continue
+      try {
+        // Proven spawnable only if a bare spawn of it does not error.
+        const probe = spawnSync(candidate, ['--version'], { stdio: 'ignore', timeout: 30000 })
+        if (!probe.error && probe.status === 0) return candidate
+      } catch { /* try the next candidate */ }
     }
+
+    // Last resort: resolve the shim's JS file and run it with the current Node.
+    // The returned value is a path the plugin execs directly, so recover the
+    // script path here and let spawn() prepend the interpreter.
+    try {
+      const which = execFileSync('which', [name]).toString().trim()
+      const real = realpathSync(which)
+      if (existsSync(real)) {
+        shimScripts.set(real, name)
+        return real
+      }
+    } catch { /* fall through to the error */ }
+    throw new Error(`not found: ${name}`)
   },
   spawn({ argv, cwd, stdio }) {
     // stdio caps are ignored here; real service collects streams
@@ -55,8 +96,13 @@ const subprocessService = {
       stdout: { readFrom: () => undefined },
       stderr: { readFrom: () => undefined }
     }
+    // If resolveExecutable fell back to a `#!/usr/bin/env node` script that
+    // Node cannot exec directly, run it under the current Node instead.
+    let spawnArgv = argv
+    const script = argv[0] && shimScripts.get(argv[0])
+    if (script !== undefined) spawnArgv = [process.execPath, argv[0], ...argv.slice(1)]
     // We bypass the stream-collection abstraction and run directly for the test.
-    const p = runProc(argv, cwd)
+    const p = runProc(spawnArgv, cwd)
     return {
       collected,
       done: p.then((r) => {
