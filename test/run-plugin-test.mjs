@@ -2,11 +2,19 @@
 // Loads the installed plugin's actual lib/index.js, mounts stub cordis
 // services (tools/subprocess/shell), calls apply(), and exercises every
 // registered tool against the real `codegraph` CLI on a real test project.
+//
+// The plugin imports `defineTool` from @deepseek-ai/dsh-tools and
+// `createUserMessage` from @deepseek-ai/dsh-llm. Those are REAL peer
+// dependencies, not stubs: resolution goes through node_modules, so whichever
+// DSH version the harness installs is the version whose argument validation,
+// Config schema, and message factory the plugin is exercised against. That is
+// what makes this suite a cross-version gate — see section 0 below.
 import { spawn } from 'node:child_process'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -146,6 +154,86 @@ const call = async (name, args) => {
   return raw
 }
 
+console.log('\n=== 0) installed DSH version + peer-range install gate ===')
+{
+  // The harness resolves the plugin's real peers from node_modules. Report the
+  // versions actually under test so a cross-version run is self-describing.
+  // Resolution order mirrors Node's own: the plugin's sibling node_modules
+  // first (a profile install / CG_PROFILE_NM staging dir), then the plugin
+  // root itself. Do NOT fall back to the repo's own node_modules after that —
+  // a stale local link would report a version the plugin never sees.
+  const readVersion = (pkg) => {
+    const candidates = [
+      join(pluginRoot, '..', pkg, 'package.json'), // sibling of the plugin dir
+      join(pluginRoot, 'node_modules', pkg, 'package.json'), // plugin-local
+      join(__dirname, '..', 'node_modules', pkg, 'package.json') // bare checkout
+    ]
+    for (const candidate of candidates) {
+      try {
+        if (existsSync(candidate)) return JSON.parse(readFileSync(candidate, 'utf8')).version
+      } catch { /* try the next candidate */ }
+    }
+    return undefined
+  }
+  const toolsVersion = readVersion('@deepseek-ai/dsh-tools')
+  const llmVersion = readVersion('@deepseek-ai/dsh-llm')
+  console.log(`   @deepseek-ai/dsh-tools: ${toolsVersion ?? '(unresolved)'}`)
+  console.log(`   @deepseek-ai/dsh-llm:   ${llmVersion ?? '(unresolved)'}`)
+  // Independently confirm what the PLUGIN itself resolves, so the printed
+  // version cannot drift from the runtime the assertions below exercise.
+  // createRequire seeded with the plugin's own entry file reproduces Node's
+  // real resolution for that module (sibling node_modules, then upward).
+  try {
+    const pluginRequire = createRequire(join(pluginRoot, 'lib/index.js'))
+    const resolvedManifest = pluginRequire.resolve('@deepseek-ai/dsh-tools/package.json')
+    const resolvedVersion = JSON.parse(readFileSync(resolvedManifest, 'utf8')).version
+    if (resolvedVersion === toolsVersion) ok(`plugin resolves dsh-tools ${resolvedVersion} (real peer, not a stub)`)
+    else bad('version probe disagrees with the plugin\'s own resolution', `probe=${toolsVersion} resolved=${resolvedVersion}`)
+  } catch (e) {
+    bad('cannot resolve @deepseek-ai/dsh-tools from the plugin — peers are not installed', null, e.message)
+  }
+
+  // DSH 0.2.0 gates installation on peerDependencies: it rejects when the
+  // running dsh version fails semver.satisfies(v, range, {includePrerelease:true}).
+  // A `<0.2.0-0` ceiling therefore hard-fails `dsh plugin add`, which is the
+  // exact regression this suite exists to prevent.
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'))
+  } catch {
+    manifest = undefined
+  }
+  const peers = manifest?.peerDependencies ?? {}
+  const dshPeers = Object.entries(peers).filter(([n]) => n === '@deepseek-ai/dsh' || n.startsWith('@deepseek-ai/dsh-'))
+  if (dshPeers.length > 0) ok(`manifest declares ${dshPeers.length} @deepseek-ai/dsh* peer range(s)`)
+  else bad('manifest declares no @deepseek-ai/dsh* peerDependencies')
+
+  // Any 0.2.x runtime must survive every declared range. Evaluate the ranges
+  // as plain SemVer comparisons so this check needs no semver dependency.
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(String(v))
+    return m ? { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] } : undefined
+  }
+  // Compare only the numeric bound that each range clause carries; that is
+  // enough to catch a ceiling that excludes a whole minor line.
+  const upperBoundExcludes = (range, target) => {
+    const t = parse(target)
+    return range.split('||').every((clause) => {
+      const upper = /<\s*(\d+)\.(\d+)\.(\d+)/.exec(clause)
+      if (!upper) return false // unbounded clause: cannot exclude
+      const u = { major: +upper[1], minor: +upper[2], patch: +upper[3] }
+      if (t.major !== u.major) return t.major >= u.major
+      if (t.minor !== u.minor) return t.minor >= u.minor
+      return t.patch >= u.patch
+    })
+  }
+  for (const version of ['0.2.0', '0.2.0-rc.2', '0.2.5']) {
+    const blocked = dshPeers.filter(([, range]) => upperBoundExcludes(range, version)).map(([n]) => n)
+    if (blocked.length === 0) ok(`peer ranges admit DSH ${version} (install gate passes)`)
+    else bad(`peer ranges REJECT DSH ${version} — \`dsh plugin add\` would hard-fail the install`, blocked.join(', '))
+  }
+}
+
 console.log('\n=== 1) plugin.apply mounts (surface: full — exercises every tool) ===')
 try {
   plugin.apply(ctx, { surface: 'full' })
@@ -221,6 +309,62 @@ const codeTools = names.filter((n) => n.startsWith('codegraph_'))
 console.log('   registered:', names.join(', '))
 if (codeTools.length === 13) ok(`13 codegraph_* tools registered`, codeTools.join(', '))
 else bad(`expected 13 codegraph_* tools, got ${codeTools.length}`, null)
+
+console.log('\n=== 4b) ToolDefinition shape matches DSH 0.2.0 contract ===')
+{
+  // defineTool is the REAL one from the installed dsh-tools, so a definition
+  // that survives this block is a definition the registry accepts.
+  const probe = registeredTools.find((t) => t.name === 'codegraph_status')
+  for (const field of ['name', 'description', 'parameters', 'output', 'execute']) {
+    if (probe[field] !== undefined) ok(`definition exposes "${field}"`)
+    else bad(`definition missing required DSH field "${field}"`)
+  }
+  if (typeof probe.execute === 'function') ok('execute is a function')
+  else bad('execute must be a function')
+
+  // output.render is the Native projection; in 0.2.0 it receives the RAW call
+  // args, which may be malformed. It must not throw and must return blocks.
+  try {
+    const blocks = probe.output.render({}, 'status-text')
+    if (Array.isArray(blocks) && blocks[0]?.type === 'text' && blocks[0].text === 'status-text') {
+      ok('output.render returns ContentBlock[] for a plain string value')
+    } else {
+      bad('output.render should return [{type:"text", text}]', JSON.stringify(blocks))
+    }
+  } catch (e) {
+    bad('output.render threw', null, e.message)
+  }
+  try {
+    const blocks = probe.output.render({}, undefined)
+    if (Array.isArray(blocks)) ok('output.render tolerates a non-string value (no throw)')
+    else bad('output.render should always return an array')
+  } catch (e) {
+    bad('output.render must not throw on malformed input', null, e.message)
+  }
+
+  // presentCall must return a ToolCallView discriminated by `card`. 0.2.0
+  // turned this into a union ('generic' | 'terminal' | 'diff'), so an
+  // untagged object would no longer be a valid view.
+  try {
+    const view = probe.presentCall({})
+    if (view && view.card === 'terminal') ok('presentCall returns a tagged terminal ToolCallView (card: "terminal")')
+    else bad('presentCall must return a card-tagged view', JSON.stringify(view))
+    if (view && typeof view.title === 'string' && view.title.length > 0) ok('terminal view carries a non-empty title (the command line)')
+    else bad('terminal view needs a non-empty title')
+  } catch (e) {
+    bad('presentCall threw', null, e.message)
+  }
+
+  // timeoutMs is optional metadata; when declared it must be a positive number.
+  const withTimeout = registeredTools.filter((t) => t.timeoutMs !== undefined)
+  if (withTimeout.length > 0 && withTimeout.every((t) => typeof t.timeoutMs === 'number' && t.timeoutMs > 0)) {
+    ok(`${withTimeout.length} tools declare a positive timeoutMs budget`)
+  } else if (withTimeout.length === 0) {
+    ok('no tool declares timeoutMs (optional in 0.2.0)')
+  } else {
+    bad('timeoutMs must be a positive number when declared')
+  }
+}
 
 console.log('\n=== 5) codegraph_status (not yet indexed) ===')
 try {
@@ -403,6 +547,15 @@ console.log('\n=== 19) frontload: structural zh prompt on indexed project → st
     }
     if (steered[0].role === 'user' && steered[0].id) ok('steered message is a valid user message (id + role)')
     else bad('steered message malformed')
+    // 0.2.0 shape: UserMessage is frozen and carries a merge-extensible source
+    // tag. The front-load listener gates on `source.kind`, so a message that
+    // lost its source would silently stop front-loading.
+    if (steered[0].source && steered[0].source.kind === 'user') ok('steered message carries source.kind === "user" (0.2.0 MessageSourceMap shape)')
+    else bad('steered message must carry a user source tag', JSON.stringify(steered[0].source))
+    if (Object.isFrozen(steered[0])) ok('steered message is frozen (0.2.0 createUserMessage freezes before publication)')
+    else bad('steered message should be frozen by createUserMessage')
+    if (Array.isArray(steered[0].content) && steered[0].content.length > 0) ok('steered message content is a ContentBlock[] array')
+    else bad('steered message content must be a non-empty ContentBlock array')
   }
 }
 
