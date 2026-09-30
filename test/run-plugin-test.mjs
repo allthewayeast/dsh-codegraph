@@ -14,7 +14,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, mkdirSync, writeFileSync } from 'node:fs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -154,6 +154,51 @@ const ctx = {
 
 // --- apply the plugin ------------------------------------------------------
 const sessionCwd = '/tmp/cg-test-proj' // tools default to this via exec.agent
+
+// The fixture project MUST exist on disk before any tool runs.
+//
+// The plugin spawns the CLI with `cwd: <project root>`, defaulting to the
+// session cwd. `spawn` with a directory that does not exist fails with
+// ENOENT — and Node reports that error against the COMMAND path
+// ("spawn /path/to/codegraph ENOENT"), not the cwd, so it reads exactly like a
+// missing binary. That misdirection cost real debugging time on CI, where the
+// runner starts with a clean /tmp and tests 5-13 all ran before `init` had
+// created the directory. A real session cwd always exists, so this is purely a
+// fixture-setup concern: create the project up front.
+function ensureFixtureProject() {
+  const files = {
+    'src/math.ts': [
+      'export function multiply(a: number, b: number): number {',
+      '  return a * b',
+      '}',
+      '',
+      'export function double(x: number): number {',
+      '  return multiply(x, 2)',
+      '}',
+      '',
+      'export function add(a: number, b: number): number {',
+      '  return a + b',
+      '}',
+      ''
+    ].join('\n'),
+    'src/index.ts': [
+      "import { double, add } from './math'",
+      '',
+      'export function main(): number {',
+      '  return double(21) + add(1, 2)',
+      '}',
+      ''
+    ].join('\n')
+  }
+  mkdirSync(join(sessionCwd, 'src'), { recursive: true })
+  for (const [rel, body] of Object.entries(files)) {
+    const target = join(sessionCwd, rel)
+    // Leave an existing index/source alone on a re-run, but make sure the
+    // tree is present either way.
+    if (!existsSync(target)) writeFileSync(target, body)
+  }
+}
+ensureFixtureProject()
 
 function makeExec() {
   const aborted = { value: false }
